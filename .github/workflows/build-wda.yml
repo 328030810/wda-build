@@ -1,0 +1,82 @@
+name: Build WDA.ipa
+
+# 触发方式
+on:
+  workflow_dispatch:    # 手动触发
+    inputs:
+      wda_ref:
+        description: 'appium/WebDriverAgent 的 git ref (tag/branch/commit)'
+        required: false
+        default: 'v15.1.6'
+
+jobs:
+  build:
+    name: Build WebDriverAgent.ipa (unsigned)
+    runs-on: macos-14     # Apple Silicon macOS + 最新 Xcode
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout WDA source
+        uses: actions/checkout@v4
+        with:
+          repository: appium/WebDriverAgent
+          ref: ${{ github.event.inputs.wda_ref || 'v15.1.6' }}
+          path: WebDriverAgent
+
+      - name: Show environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun simctl list runtimes | head -20
+
+      - name: Build WebDriverAgentRunner for iOS device (no codesign)
+        run: |
+          cd WebDriverAgent
+          # build-for-testing 编译 XCTest bundle，CODE_SIGN_IDENTITY="" 空签名
+          # 这样产出的 .app 可以直接拷出来给爱思助手重签
+          xcodebuild \
+            -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -sdk iphoneos \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            build-for-testing
+
+      - name: Locate built .app
+        id: find_app
+        run: |
+          # 从 build products 找 WebDriverAgentRunner-Runner.app
+          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "WebDriverAgentRunner-Runner.app" -type d 2>/dev/null | head -1)
+          echo "Found APP: $APP_PATH"
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::WebDriverAgentRunner-Runner.app not found"
+            exit 1
+          fi
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
+
+      - name: Package as unsigned .ipa
+        run: |
+          APP_PATH="${{ steps.find_app.outputs.app_path }}"
+          STAGING=$(mktemp -d)
+          mkdir -p "$STAGING/Payload"
+          cp -R "$APP_PATH" "$STAGING/Payload/"
+          cd "$STAGING"
+          zip -r WebDriverAgent.ipa Payload
+          ls -lh WebDriverAgent.ipa
+          # 拷贝到 GITHUB_WORKSPACE 以便上传
+          cp WebDriverAgent.ipa "$GITHUB_WORKSPACE/WebDriverAgent.ipa"
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebDriverAgent-unsigned-ipa
+          path: WebDriverAgent.ipa
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          ls -lh WebDriverAgent.ipa
+          echo "### Build OK" >> $GITHUB_STEP_SUMMARY
+          echo "Artifact: WebDriverAgent-unsigned-ipa" >> $GITHUB_STEP_SUMMARY
+          echo "下一步: 下载 artifact 后用爱思助手 + 免费 Apple ID 重签" >> $GITHUB_STEP_SUMMARY
