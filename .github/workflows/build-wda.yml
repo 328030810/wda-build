@@ -11,7 +11,7 @@ on:
 
 jobs:
   build:
-    name: Build WebDriverAgent.ipa (unsigned)
+    name: Build WebDriverAgent.ipa (ad-hoc signed)
     runs-on: macos-14     # Apple Silicon macOS + 最新 Xcode
     timeout-minutes: 30
 
@@ -33,7 +33,6 @@ jobs:
         run: |
           cd WebDriverAgent
           # build-for-testing 编译 XCTest bundle，CODE_SIGN_IDENTITY="" 空签名
-          # 这样产出的 .app 可以直接拷出来给爱思助手重签
           xcodebuild \
             -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
@@ -55,7 +54,38 @@ jobs:
           fi
           echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
 
-      - name: Package as unsigned .ipa
+      - name: Ad-hoc re-sign ALL binaries (main app + Frameworks/* + PlugIns/*.xctest)
+        run: |
+          APP_PATH="${{ steps.find_app.outputs.app_path }}"
+          echo "=== Signing embedded frameworks ==="
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            find "$APP_PATH/Frameworks" -maxdepth 1 -mindepth 1 -type d | while read fw; do
+              echo "  -> $fw"
+              codesign --force --sign - --timestamp=none "$fw"
+            done
+          fi
+          echo "=== Signing xctest bundles under PlugIns ==="
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            find "$APP_PATH/PlugIns" -maxdepth 1 -mindepth 1 -type d | while read xt; do
+              echo "  -> $xt"
+              codesign --force --sign - --timestamp=none "$xt"
+            done
+          fi
+          echo "=== Signing main app (with embedded signature) ==="
+          codesign --force --sign - --timestamp=none "$APP_PATH"
+          echo "=== Verify main app signature ==="
+          codesign -dvvv "$APP_PATH" 2>&1 | head -15 || true
+          echo "=== Verify xctest bundle signature ==="
+          XCTEST="$(find "$APP_PATH/PlugIns" -name '*.xctest' -type d | head -1)"
+          echo "xctest bundle: $XCTEST"
+          if [ -n "$XCTEST" ]; then
+            codesign -dvvv "$XCTEST" 2>&1 | head -15 || true
+            XCTEST_BIN="$(find "$XCTEST" -type f ! -name '*.plist' ! -name '*.json' | head -1)"
+            echo "xctest binary: $XCTEST_BIN"
+            codesign -dvvv "$XCTEST_BIN" 2>&1 | head -15 || true
+          fi
+
+      - name: Package as ad-hoc signed .ipa
         run: |
           APP_PATH="${{ steps.find_app.outputs.app_path }}"
           STAGING=$(mktemp -d)
@@ -70,13 +100,14 @@ jobs:
       - name: Upload .ipa artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WebDriverAgent-unsigned-ipa
+          name: WebDriverAgent-adhoc-ipa
           path: WebDriverAgent.ipa
           retention-days: 30
 
       - name: Summary
         run: |
           ls -lh WebDriverAgent.ipa
-          echo "### Build OK" >> $GITHUB_STEP_SUMMARY
-          echo "Artifact: WebDriverAgent-unsigned-ipa" >> $GITHUB_STEP_SUMMARY
-          echo "下一步: 下载 artifact 后用爱思助手 + 免费 Apple ID 重签" >> $GITHUB_STEP_SUMMARY
+          echo "### Build OK (ad-hoc signed)" >> $GITHUB_STEP_SUMMARY
+          echo "Artifact: WebDriverAgent-adhoc-ipa" >> $GITHUB_STEP_SUMMARY
+          echo "所有 Mach-O 二进制（主 app + Frameworks/* + PlugIns/*.xctest）均已 ad-hoc 签名（cdhash 存在）。" >> $GITHUB_STEP_SUMMARY
+          echo "下一步: 下载 artifact 后用爱思助手 + 免费 Apple ID 重签（爱思会把主 app 改为 dev 签，xctest 子二进制保留 ad-hoc，iOS 16 Library Validation 接受）。" >> $GITHUB_STEP_SUMMARY
