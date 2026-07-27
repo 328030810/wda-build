@@ -1,4 +1,4 @@
-﻿name: Build WDA.ipa
+name: Build WDA.ipa
 
 on:
   workflow_dispatch:
@@ -43,11 +43,25 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM=""
 
+      - name: Find and list .app output
+        run: |
+          echo "=== Searching for .app in build output ==="
+          find build/Build/Products -name "*.app" -type d 2>/dev/null || echo "No .app found in build/Build/Products"
+          APP_PATH=$(find build/Build/Products -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
+          echo "APP_PATH=$APP_PATH"
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: WebDriverAgentRunner-Runner.app not found!"
+            ls -la build/Build/Products/ 2>/dev/null || echo "Products dir not found"
+            exit 1
+          fi
+
       - name: Create IPA (unsigned)
         if: github.event.inputs.add_adhoc_sign == 'false'
         run: |
+          APP_PATH=$(find build/Build/Products -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
+          echo "Using app at: $APP_PATH"
           mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app Payload/
+          cp -r "$APP_PATH" Payload/
           zip -r WebDriverAgent.ipa Payload/
           echo "=== IPA contents ==="
           unzip -l WebDriverAgent.ipa | head -30
@@ -55,17 +69,18 @@ jobs:
       - name: Add ad-hoc signature to all binaries
         if: github.event.inputs.add_adhoc_sign == 'true'
         run: |
-          APP_DIR="build/Build/Products/Release-iphoneos/WebDriverAgentRunner-Runner.app"
+          APP_PATH=$(find build/Build/Products -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
+          echo "Using app at: $APP_PATH"
           
           # Find and sign all Mach-O binaries
-          for binary in $(find "$APP_DIR" -type f -exec sh -c 'file "$1" | grep -q "Mach-O" && echo "$1"' _ {} \;); do
+          for binary in $(find "$APP_PATH" -type f -exec sh -c 'file "$1" | grep -q "Mach-O" && echo "$1"' _ {} \;); do
             echo "Signing: $binary"
             codesign --force --sign - --timestamp=none "$binary"
           done
           
           # Create IPA
           mkdir -p Payload
-          cp -r "$APP_DIR" Payload/
+          cp -r "$APP_PATH" Payload/
           zip -r WebDriverAgent.ipa Payload/
 
       - name: Upload IPA artifact
