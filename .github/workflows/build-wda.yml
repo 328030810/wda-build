@@ -1,90 +1,113 @@
 name: Build WDA.ipa
 
+# 触发方式
 on:
-  workflow_dispatch:
+  workflow_dispatch:    # 手动触发
     inputs:
-      wda_version:
-        description: 'WebDriverAgent version tag (e.g. v11.4.3)'
-        required: true
-        default: 'v11.4.3'
-      add_adhoc_sign:
-        description: 'Add ad-hoc signature (not needed for Sideloadly)'
-        required: true
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+      wda_ref:
+        description: 'appium/WebDriverAgent 的 git ref (tag/branch/commit)'
+        required: false
+        default: 'v15.1.6'
 
 jobs:
   build:
-    runs-on: macos-14
+    name: Build WebDriverAgent.ipa (ad-hoc signed)
+    runs-on: macos-14     # Apple Silicon macOS + 最新 Xcode
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout WDA
+      - name: Checkout WDA source
         uses: actions/checkout@v4
         with:
           repository: appium/WebDriverAgent
-          ref: ${{ github.event.inputs.wda_version }}
+          ref: ${{ github.event.inputs.wda_ref || 'v15.1.6' }}
+          path: WebDriverAgent
 
-      - name: Select Xcode
+      - name: Show environment
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app
+          sw_vers
           xcodebuild -version
+          xcrun simctl list runtimes | head -20
 
-      - name: Build for testing (unsigned)
+      - name: Build WebDriverAgentRunner for iOS device (no codesign)
         run: |
-          xcodebuild build-for-testing \
+          cd WebDriverAgent
+          # build-for-testing 编译 XCTest bundle，CODE_SIGN_IDENTITY="" 空签名
+          xcodebuild \
             -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
+            -sdk iphoneos \
+            -configuration Release \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM=""
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            build-for-testing
 
-      - name: Find and list .app output
+      - name: Locate built .app
+        id: find_app
         run: |
-          echo "=== Searching for .app in build output ==="
-          find build/Build/Products -name "*.app" -type d 2>/dev/null || echo "No .app found in build/Build/Products"
-          APP_PATH=$(find build/Build/Products -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
-          echo "APP_PATH=$APP_PATH"
+          # 从 build products 找 WebDriverAgentRunner-Runner.app
+          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "WebDriverAgentRunner-Runner.app" -type d 2>/dev/null | head -1)
+          echo "Found APP: $APP_PATH"
           if [ -z "$APP_PATH" ]; then
-            echo "ERROR: WebDriverAgentRunner-Runner.app not found!"
-            ls -la build/Build/Products/ 2>/dev/null || echo "Products dir not found"
+            echo "::error::WebDriverAgentRunner-Runner.app not found"
             exit 1
           fi
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
 
-      - name: Create IPA (unsigned)
-        if: github.event.inputs.add_adhoc_sign == 'false'
+      - name: Ad-hoc re-sign ALL binaries (main app + Frameworks/* + PlugIns/*.xctest)
         run: |
-          APP_PATH=$(find build/Build/Products -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
-          echo "Using app at: $APP_PATH"
-          mkdir -p Payload
-          cp -r "$APP_PATH" Payload/
-          zip -r WebDriverAgent.ipa Payload/
-          echo "=== IPA contents ==="
-          unzip -l WebDriverAgent.ipa | head -30
+          APP_PATH="${{ steps.find_app.outputs.app_path }}"
+          echo "=== Signing embedded frameworks ==="
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            find "$APP_PATH/Frameworks" -maxdepth 1 -mindepth 1 -type d | while read fw; do
+              echo "  -> $fw"
+              codesign --force --sign - --timestamp=none "$fw"
+            done
+          fi
+          echo "=== Signing xctest bundles under PlugIns ==="
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            find "$APP_PATH/PlugIns" -maxdepth 1 -mindepth 1 -type d | while read xt; do
+              echo "  -> $xt"
+              codesign --force --sign - --timestamp=none "$xt"
+            done
+          fi
+          echo "=== Signing main app (with embedded signature) ==="
+          codesign --force --sign - --timestamp=none "$APP_PATH"
+          echo "=== Verify main app signature ==="
+          codesign -dvvv "$APP_PATH" 2>&1 | head -15 || true
+          echo "=== Verify xctest bundle signature ==="
+          XCTEST="$(find "$APP_PATH/PlugIns" -name '*.xctest' -type d | head -1)"
+          echo "xctest bundle: $XCTEST"
+          if [ -n "$XCTEST" ]; then
+            codesign -dvvv "$XCTEST" 2>&1 | head -15 || true
+            XCTEST_BIN="$(find "$XCTEST" -type f ! -name '*.plist' ! -name '*.json' | head -1)"
+            echo "xctest binary: $XCTEST_BIN"
+            codesign -dvvv "$XCTEST_BIN" 2>&1 | head -15 || true
+          fi
 
-      - name: Add ad-hoc signature to all binaries
-        if: github.event.inputs.add_adhoc_sign == 'true'
+      - name: Package as ad-hoc signed .ipa
         run: |
-          APP_PATH=$(find build/Build/Products -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
-          echo "Using app at: $APP_PATH"
-          
-          # Find and sign all Mach-O binaries
-          for binary in $(find "$APP_PATH" -type f -exec sh -c 'file "$1" | grep -q "Mach-O" && echo "$1"' _ {} \;); do
-            echo "Signing: $binary"
-            codesign --force --sign - --timestamp=none "$binary"
-          done
-          
-          # Create IPA
-          mkdir -p Payload
-          cp -r "$APP_PATH" Payload/
-          zip -r WebDriverAgent.ipa Payload/
+          APP_PATH="${{ steps.find_app.outputs.app_path }}"
+          STAGING=$(mktemp -d)
+          mkdir -p "$STAGING/Payload"
+          cp -R "$APP_PATH" "$STAGING/Payload/"
+          cd "$STAGING"
+          zip -r WebDriverAgent.ipa Payload
+          ls -lh WebDriverAgent.ipa
+          # 拷贝到 GITHUB_WORKSPACE 以便上传
+          cp WebDriverAgent.ipa "$GITHUB_WORKSPACE/WebDriverAgent.ipa"
 
-      - name: Upload IPA artifact
+      - name: Upload .ipa artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WebDriverAgent-ipa-${{ github.event.inputs.wda_version }}
+          name: WebDriverAgent-adhoc-ipa
           path: WebDriverAgent.ipa
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          ls -lh WebDriverAgent.ipa
+          echo "### Build OK (ad-hoc signed)" >> $GITHUB_STEP_SUMMARY
+          echo "Artifact: WebDriverAgent-adhoc-ipa" >> $GITHUB_STEP_SUMMARY
+          echo "所有 Mach-O 二进制（主 app + Frameworks/* + PlugIns/*.xctest）均已 ad-hoc 签名（cdhash 存在）。" >> $GITHUB_STEP_SUMMARY
+          echo "下一步: 下载 artifact 后用爱思助手 + 免费 Apple ID 重签（爱思会把主 app 改为 dev 签，xctest 子二进制保留 ad-hoc，iOS 16 Library Validation 接受）。" >> $GITHUB_STEP_SUMMARY
